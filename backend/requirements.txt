@@ -7,6 +7,7 @@
 # ── Web Framework ─────────────────────────────────────────────
 fastapi>=0.110.0,<1.0.0
 uvicorn[standard]>=0.29.0,<1.0.0
+gunicorn>=22.0.0                    # required for Azure App Service Linux deployment
 python-multipart>=0.0.9
 
 # ── Database ──────────────────────────────────────────────────
