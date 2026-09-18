@@ -84,6 +84,7 @@ export interface InvestigationCandidate {
   lat: number | null;
   lon: number | null;
   positionTimestamp: string | null;
+  track?: Array<{ lat: number; lon: number; ts?: string }>;
 }
 
 export interface InvestigationResult {

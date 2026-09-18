@@ -99,6 +99,9 @@ class CandidateMatch:
     lon: Optional[float]
     position_timestamp: Optional[str]
 
+    # Chronological vessel track points: [{"lat": float, "lon": float, "ts": str}, ...]
+    track: List[Dict[str, Any]] = field(default_factory=list)
+
     # Disclaimer
     disclaimer: str = (
         "This vessel is a CANDIDATE only. The attribution score is an "
@@ -480,6 +483,16 @@ def find_candidate_vessels(
                 else None
             )
 
+            # Chronological positions for this vessel (ordered by ts ASC from SQL)
+            vessel_track = [
+                {
+                    "lat": float(p["lat"]),
+                    "lon": float(p["lon"]),
+                    "ts": p["ts"].isoformat() if hasattr(p["ts"], "isoformat") else str(p["ts"]),
+                }
+                for p in pings
+            ]
+
             candidates.append(CandidateMatch(
                 rank=0,
                 mmsi=str(mmsi),
@@ -496,6 +509,7 @@ def find_candidate_vessels(
                 lat=closest_lat,
                 lon=closest_lon,
                 position_timestamp=closest_ts,
+                track=vessel_track,
             ))
 
         # Sort by attribution score descending, cap at max

@@ -6,7 +6,7 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "test": "node --experimental-strip-types --loader ./tests/loader.mjs --test tests/real-data.test.ts"
+    "test": "node --experimental-strip-types --loader ./tests/loader.mjs --test tests/real-data.test.ts tests/historical-map.test.ts"
   },
   "dependencies": {
     "@react-three/drei": "^9.122.0",

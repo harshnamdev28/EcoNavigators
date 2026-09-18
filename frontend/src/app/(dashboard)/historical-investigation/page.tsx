@@ -143,10 +143,10 @@ export default function HistoricalInvestigationPage() {
         </div>
 
         {/* Right: Map + results */}
-        <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+        <div style={{ flex: 1, display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0, overflow: 'hidden' }}>
 
           {/* Map */}
-          <div style={{ flex: 1, position: 'relative', minHeight: '300px' }}>
+          <div style={{ flex: 1, position: 'relative', width: '100%', height: '100%', minHeight: '350px', overflow: 'hidden' }}>
             <InvestigationMapCanvas
               result={result}
               spillLat={spillLat}

@@ -2168,6 +2168,7 @@ async def run_historical_investigation(
                 "lat":                    c.lat,
                 "lon":                    c.lon,
                 "positionTimestamp":      c.position_timestamp,
+                "track":                  c.track if hasattr(c, "track") else [],
             }
             for c in ais_candidates
         ]
