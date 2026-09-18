@@ -1,10 +1,11 @@
-﻿'use client';
+'use client';
 
 import React, { useState } from 'react';
-import { AlertTriangle, WifiOff, FlaskConical } from 'lucide-react';
+import { AlertTriangle, WifiOff, FlaskConical, Cpu } from 'lucide-react';
 import InputPanel from '@/components/investigation/InputPanel';
 import InvestigationMapCanvas from '@/components/investigation/InvestigationMapCanvas';
 import CandidateTable from '@/components/investigation/CandidateTable';
+import ImageAnalysisPanel from '@/components/investigation/ImageAnalysisPanel';
 import { InvestigationResult, InvestigationCandidate } from '@/types/investigation';
 import { runHistoricalInvestigation } from '@/services/api';
 
@@ -13,6 +14,7 @@ export default function HistoricalInvestigationPage() {
   const [activeCandidate, setActiveCandidate] = useState<InvestigationCandidate | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [uploadedFile, setUploadedFile] = useState<File | null>(null);
 
   // Track the submitted spill coordinates for map centering before result arrives
   const [pendingLat, setPendingLat] = useState<number | null>(null);
@@ -25,6 +27,8 @@ export default function HistoricalInvestigationPage() {
     durationHours: number;
     windage: number;
     nParticles: number;
+    uncertaintyRadiusM?: number;
+    dataMode?: 'DEMO' | 'LIVE';
     file?: File;
   }) {
     setIsLoading(true);
@@ -33,6 +37,7 @@ export default function HistoricalInvestigationPage() {
     setActiveCandidate(null);
     setPendingLat(params.latitude);
     setPendingLon(params.longitude);
+    if (params.file) setUploadedFile(params.file);
 
     try {
       const res = await runHistoricalInvestigation(params);
@@ -49,6 +54,7 @@ export default function HistoricalInvestigationPage() {
 
   const spillLat = result?.spillObservation.latitude ?? pendingLat;
   const spillLon = result?.spillObservation.longitude ?? pendingLon;
+
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', width: '100%', height: '100%', overflow: 'hidden' }}>
@@ -122,8 +128,19 @@ export default function HistoricalInvestigationPage() {
 
       {/* Main layout: Input panel + Map */}
       <div style={{ flex: 1, display: 'flex', overflow: 'hidden' }}>
-        {/* Left: Input panel */}
-        <InputPanel onSubmit={handleSubmit} isLoading={isLoading} />
+        {/* Left: Input panel + image analysis */}
+        <div style={{ display: 'flex', flexDirection: 'column', overflowY: 'auto' }}>
+          <InputPanel onSubmit={handleSubmit} isLoading={isLoading} />
+          {/* MIT-B2 segmentation result panel */}
+          {(result?.imageAnalysis || (isLoading && uploadedFile)) && (
+            <div style={{ padding: '0 16px 16px' }}>
+              <ImageAnalysisPanel
+                imageAnalysis={result?.imageAnalysis ?? null}
+                uploadedFile={uploadedFile}
+              />
+            </div>
+          )}
+        </div>
 
         {/* Right: Map + results */}
         <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
@@ -258,6 +275,8 @@ export default function HistoricalInvestigationPage() {
                   { label: 'TRAJECTORY STEPS', value: result.trajectory.timesteps.length },
                   { label: 'CANDIDATE VESSELS', value: result.candidates.length },
                   { label: 'ENV DATA', value: result.environment.dataMode },
+                  { label: 'ENV PROVIDER', value: result.environment.provider },
+                  { label: 'GEOMETRY SOURCE', value: result.spillObservation.geometrySource ?? 'POINT_ONLY' },
                 ].map(({ label, value }) => (
                   <div key={label}>
                     <div style={{ color: 'var(--text-muted)', fontSize: '0.58rem', fontFamily: 'var(--font-mono)' }}>{label}</div>

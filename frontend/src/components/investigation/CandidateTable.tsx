@@ -1,4 +1,4 @@
-﻿'use client';
+'use client';
 import React from 'react';
 import { AlertTriangle, Ship } from 'lucide-react';
 import { InvestigationCandidate } from '@/types/investigation';
@@ -95,7 +95,7 @@ export default function CandidateTable({
         <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.75rem' }}>
           <thead>
             <tr style={{ borderBottom: '1px solid rgba(255,255,255,0.06)' }}>
-              {['Rank', 'Vessel', 'MMSI', 'Min Dist', 'Traj Overlap', 'Time Match', 'AIS Anomaly', 'Score'].map((h) => (
+              {['Rank', 'Vessel', 'MMSI', 'Min Dist', 'Traj Overlap', 'Time Match', 'Dist Score', 'Src Region', 'AIS Anomaly', 'Score'].map((h) => (
                 <th key={h} style={{
                   padding: '8px 12px',
                   textAlign: 'left',
@@ -143,6 +143,12 @@ export default function CandidateTable({
                   </td>
                   <td style={{ padding: '8px 12px' }}>
                     <ScoreBar value={c.timeMatchScore} />
+                  </td>
+                  <td style={{ padding: '8px 12px' }}>
+                    <ScoreBar value={c.distanceScore ?? 0} />
+                  </td>
+                  <td style={{ padding: '8px 12px' }}>
+                    <ScoreBar value={c.sourceRegionScore ?? 0} />
                   </td>
                   <td style={{ padding: '8px 12px' }}>
                     <ScoreBar value={c.aisAnomalyScore} />

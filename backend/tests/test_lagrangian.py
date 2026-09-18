@@ -314,12 +314,14 @@ def test_mmsi_deduplication():
         CandidateMatch(rank=1, mmsi="123456789", vessel_name="V1", imo=None,
                        min_distance_km=5.0, trajectory_overlap_score=0.8,
                        time_match_score=0.6, ais_anomaly_score=0.5,
-                       distance_score=0.9, attribution_score=75.0,
+                       distance_score=0.9, source_region_score=0.0,
+                       attribution_score=75.0,
                        matching_ais_pings=10, lat=25.7, lon=-80.1, position_timestamp=None),
         CandidateMatch(rank=2, mmsi="987654321", vessel_name="V2", imo=None,
                        min_distance_km=20.0, trajectory_overlap_score=0.4,
                        time_match_score=0.3, ais_anomaly_score=0.0,
-                       distance_score=0.7, attribution_score=40.0,
+                       distance_score=0.7, source_region_score=0.0,
+                       attribution_score=40.0,
                        matching_ais_pings=5, lat=25.5, lon=-80.2, position_timestamp=None),
     ]
 

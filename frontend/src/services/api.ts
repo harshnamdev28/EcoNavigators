@@ -531,8 +531,12 @@ import type { InvestigationResult } from '@/types/investigation';
  * POST /api/v1/historical-investigation
  *
  * Accepts multipart form data. Runs Lagrangian backtracking and AIS matching.
+ * If an image is uploaded, runs MIT-B2 U-Net segmentation to derive the spill
+ * polygon (IMAGE_DERIVED). Otherwise uses supplied lat/lon (POINT_ONLY).
  * Always returns structured result even if AIS matching finds no candidates.
  * NEVER falls back to fabricated vessels.
+ *
+ * @param params.dataMode  "DEMO" (mock env data) | "LIVE" (NOAA ERDDAP HYCOM)
  */
 export async function runHistoricalInvestigation(params: {
   latitude: number;
@@ -541,6 +545,8 @@ export async function runHistoricalInvestigation(params: {
   durationHours: number;
   windage: number;
   nParticles: number;
+  uncertaintyRadiusM?: number;
+  dataMode?: 'DEMO' | 'LIVE';
   file?: File;
 }): Promise<InvestigationResult> {
   const formData = new FormData();
@@ -550,6 +556,8 @@ export async function runHistoricalInvestigation(params: {
   formData.append('duration_hours', String(params.durationHours));
   formData.append('windage', String(params.windage));
   formData.append('n_particles', String(params.nParticles));
+  formData.append('uncertainty_radius_m', String(params.uncertaintyRadiusM ?? 5000));
+  formData.append('data_mode', params.dataMode ?? 'DEMO');
   if (params.file) {
     formData.append('file', params.file);
   }
@@ -573,4 +581,3 @@ export async function runHistoricalInvestigation(params: {
 
   return res.json() as Promise<InvestigationResult>;
 }
-

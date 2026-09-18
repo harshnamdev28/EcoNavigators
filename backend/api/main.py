@@ -1918,6 +1918,8 @@ async def run_historical_investigation(
     duration_hours: int = Form(default=24, ge=1, le=48),
     windage: float = Form(default=0.03, ge=0.005, le=0.10),
     n_particles: int = Form(default=500, ge=10, le=1000),
+    uncertainty_radius_m: float = Form(default=5000.0, ge=500.0, le=100000.0),
+    data_mode: str = Form(default="DEMO"),
     file: Optional[UploadFile] = File(default=None),
 ):
     """
@@ -1926,54 +1928,151 @@ async def run_historical_investigation(
     Runs Lagrangian particle backtracking from an observed oil-spill location
     and matches historical AIS vessel data to produce attribution candidates.
 
-    Data mode:
-      "dataMode": "DEMO"  — when MockEnvironmentalProvider is active (default)
-      "dataMode": "LIVE"  — when a real env-data provider is configured
+    Steps:
+      1. Validate inputs
+      2. If image uploaded: run MIT-B2 U-Net segmentation to get spill polygon
+         (IMAGE_DERIVED geometry). Otherwise: use supplied lat/lon (POINT_ONLY).
+      3. Run Lagrangian backward simulation (windage ensemble 0.01/0.03/0.04)
+      4. Match historical AIS against particle corridor
+      5. Persist to DB
+      6. Return full response
 
-    Results are CANDIDATE vessels only — NOT confirmed polluters.
+    data_mode:
+      "DEMO" -> MockEnvironmentalProvider (always works, labeled as DEMO)
+      "LIVE" -> NOAA ERDDAP HYCOM (real data; never silently falls back to mock)
+
+    Results are CANDIDATE vessels only -- NOT confirmed polluters.
     """
-    # ── 1. Validate inputs ────────────────────────────────────────────────
+    import os as _os
+    from datetime import datetime as _dt, timezone as _tz
+
+    # -- 1. Validate inputs ------------------------------------------------
     if not (-90.0 <= latitude <= 90.0):
         raise HTTPException(status_code=422, detail=f"Invalid latitude: {latitude}")
     if not (-180.0 <= longitude <= 180.0):
         raise HTTPException(status_code=422, detail=f"Invalid longitude: {longitude}")
+
+    data_mode_upper = data_mode.strip().upper()
+    if data_mode_upper not in ("DEMO", "LIVE"):
+        raise HTTPException(status_code=422, detail="data_mode must be 'DEMO' or 'LIVE'")
 
     try:
         spill_ts = parse_spill_timestamp(timestamp)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
 
+    # -- 2. Image segmentation via MIT-B2 U-Net ---------------------------
     image_filename: Optional[str] = None
+    image_bytes: Optional[bytes] = None
+    segmentation_result = None
+    image_analysis_response: Optional[dict] = None
+
     if file is not None:
         image_filename = file.filename
+        try:
+            image_bytes = await file.read()
+        except Exception as exc:
+            logger.warning("Failed to read uploaded image: %s", exc)
+            image_bytes = None
 
-    # ── 2. Build SpillObservation ─────────────────────────────────────────
+    if image_bytes:
+        try:
+            from sar_pipeline.mit_b2_inference import analyze_oil_spill
+            segmentation_result = analyze_oil_spill(image_bytes)
+
+            image_analysis_response = {
+                "model":                  segmentation_result.model_name,
+                "detected":               segmentation_result.detected,
+                "geometrySource":         segmentation_result.geometry_source,
+                "spillPixelCount":        segmentation_result.spill_pixel_count,
+                "totalPixels":            segmentation_result.total_pixels,
+                "spillFraction":          segmentation_result.spill_fraction,
+                "spillAreaKm2":           segmentation_result.spill_area_km2,
+                "centroidRel":            list(segmentation_result.centroid_rel) if segmentation_result.centroid_rel else None,
+                "boundingBoxRel":         list(segmentation_result.bounding_box_rel) if segmentation_result.bounding_box_rel else None,
+                "segmentationConfidence": segmentation_result.segmentation_confidence,
+                "maskPngBase64":          segmentation_result.mask_png_base64,
+                "reason":                 segmentation_result.reason,
+                "error":                  segmentation_result.error,
+            }
+
+            if segmentation_result.error:
+                logger.warning("[Investigation] MIT-B2 inference error: %s", segmentation_result.error)
+
+        except Exception as exc:
+            logger.error("[Investigation] MIT-B2 inference failed: %s", exc, exc_info=True)
+            image_analysis_response = {
+                "model":    "MIT-B2-U-Net",
+                "detected": False,
+                "error":    str(exc),
+            }
+
+    # -- 3. Build SpillObservation ----------------------------------------
+    spill_polygon: Optional[list] = None
+    geometry_source = "POINT_ONLY"
+
+    if segmentation_result and segmentation_result.detected and segmentation_result.polygon_rel:
+        from sar_pipeline.mit_b2_inference import segmentation_polygon_to_geographic
+        try:
+            geo_polygon = segmentation_polygon_to_geographic(
+                segmentation_result.polygon_rel,
+                spill_lat=latitude,
+                spill_lon=longitude,
+            )
+            spill_polygon = geo_polygon
+            geometry_source = "IMAGE_DERIVED"
+            logger.info(
+                "[Investigation] MIT-B2 detected spill. Geometry: IMAGE_DERIVED, "
+                "polygon vertices: %d, area: %s km2",
+                len(geo_polygon),
+                segmentation_result.spill_area_km2,
+            )
+        except Exception as exc:
+            logger.warning("[Investigation] Polygon geo-conversion failed: %s", exc)
+            spill_polygon = None
+
     try:
         obs = SpillObservation(
             latitude=latitude,
             longitude=longitude,
             timestamp=spill_ts,
             image_filename=image_filename,
-            uncertainty_radius_m=5_000.0,
+            polygon=spill_polygon,
+            uncertainty_radius_m=uncertainty_radius_m,
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
 
-    # ── 3. Run Lagrangian model ───────────────────────────────────────────
-    # Use MockEnvironmentalProvider (DEMO) by default.
-    # To switch to a live provider, read credentials from environment vars and
-    # instantiate the appropriate EnvironmentalDataProvider subclass here.
-    provider = MockEnvironmentalProvider()
+    # -- 4. Select environmental data provider ----------------------------
+    env_error: Optional[str] = None
+    try:
+        from fusion.environmental_providers import get_provider
+        from fusion.lagrangian_model import EnvironmentalDataUnavailable
+        provider = get_provider(data_mode_upper)
+    except Exception as exc:
+        if data_mode_upper == "LIVE":
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    f"LIVE environmental data unavailable: {exc}. "
+                    "Switch to data_mode=DEMO or configure environmental data credentials."
+                ),
+            )
+        provider = MockEnvironmentalProvider()
+        env_error = str(exc)
+
     lag_model = LagrangianModel(provider)
 
+    # -- 5. Run Lagrangian backward simulation ----------------------------
+    windage_ensemble = (0.01, round(windage, 3), round(min(0.04, windage + 0.01), 3))
     try:
         result = lag_model.run_backward(
             obs=obs,
             n_particles=n_particles,
             duration_hours=float(duration_hours),
             timestep_min=15,
-            windage_coefficients=(0.01, windage, min(0.04, windage + 0.01)),
-            seed=None,    # non-deterministic for real investigations
+            windage_coefficients=windage_ensemble,
+            seed=None,
         )
     except Exception as exc:
         raise HTTPException(
@@ -1981,10 +2080,21 @@ async def run_historical_investigation(
             detail=f"Lagrangian simulation failed: {str(exc)}",
         )
 
-    # ── 4. Query historical AIS ───────────────────────────────────────────
+    # -- 6. Query historical AIS (with fixed time_match_score) ------------
+    trajectory_timestamps = []
+    for step in result.trajectory_steps:
+        try:
+            ts_step = _dt.fromisoformat(step.timestamp.replace("Z", "+00:00"))
+            if ts_step.tzinfo is None:
+                ts_step = ts_step.replace(tzinfo=_tz.utc)
+            trajectory_timestamps.append(ts_step)
+        except Exception:
+            pass
+
     trajectory_centroids = [
         (step.lat, step.lon) for step in result.trajectory_steps
     ]
+
     ais_candidates = []
     ais_error: Optional[str] = None
     try:
@@ -1994,79 +2104,128 @@ async def run_historical_investigation(
             spill_lon=longitude,
             spill_timestamp=spill_ts,
             duration_hours=float(duration_hours),
+            source_centroid_lat=result.source_region.centroid_lat,
+            source_centroid_lon=result.source_region.centroid_lon,
+            envelope_polygon=result.envelope_polygon,
+            trajectory_timestamps=trajectory_timestamps,
         )
     except Exception as exc:
         ais_error = str(exc)
+        logger.warning("[Investigation] AIS matching failed: %s", exc)
 
-    # ── 5. Save investigation to DB ───────────────────────────────────────
+    # -- 7. Save investigation to DB -------------------------------------
     try:
         conn = get_connection()
         cur = conn.cursor()
 
-        # Compact trajectory summary (centroid per step only — not per-particle)
         traj_summary = [
             {
-                "step": s.step,
+                "step":      s.step,
                 "hours_ago": s.hours_ago,
-                "ts": s.timestamp,
-                "lat": s.lat,
-                "lon": s.lon,
+                "ts":        s.timestamp,
+                "lat":       s.lat,
+                "lon":       s.lon,
             }
             for s in result.trajectory_steps
         ]
 
-        # Build PostGIS polygon from source region (lon, lat for ST_MakePoint)
         source_polygon_pts = result.source_region.polygon
         source_wkt: Optional[str] = None
         if len(source_polygon_pts) >= 3:
             ring = ", ".join(
-                f"{lon} {lat}" for lat, lon in source_polygon_pts
+                f"{lon_p} {lat_p}" for lat_p, lon_p in source_polygon_pts
             )
-            # Close the ring
             first_lat, first_lon = source_polygon_pts[0]
             ring += f", {first_lon} {first_lat}"
             source_wkt = f"POLYGON(({ring}))"
 
         candidates_json_list = [
             {
-                "rank": c.rank,
-                "mmsi": c.mmsi,
-                "vesselName": c.vessel_name,
-                "imo": c.imo,
-                "minDistanceKm": c.min_distance_km,
+                "rank":                   c.rank,
+                "mmsi":                   c.mmsi,
+                "vesselName":             c.vessel_name,
+                "imo":                    c.imo,
+                "minDistanceKm":          c.min_distance_km,
                 "trajectoryOverlapScore": c.trajectory_overlap_score,
-                "timeMatchScore": c.time_match_score,
-                "aisAnomalyScore": c.ais_anomaly_score,
-                "attributionScore": c.attribution_score,
-                "matchingAisPings": c.matching_ais_pings,
-                "lat": c.lat,
-                "lon": c.lon,
-                "positionTimestamp": c.position_timestamp,
+                "timeMatchScore":         c.time_match_score,
+                "aisAnomalyScore":        c.ais_anomaly_score,
+                "distanceScore":          c.distance_score,
+                "sourceRegionScore":      c.source_region_score,
+                "attributionScore":       c.attribution_score,
+                "matchingAisPings":       c.matching_ais_pings,
+                "lat":                    c.lat,
+                "lon":                    c.lon,
+                "positionTimestamp":      c.position_timestamp,
             }
             for c in ais_candidates
         ]
 
-        cur.execute("""
-            INSERT INTO historical_investigations
-                (spill_lat, spill_lon, spill_timestamp, image_filename,
-                 duration_hours, particle_count, timestep_minutes, windage,
-                 windage_ensemble, data_mode, provider_name, status,
-                 trajectory_summary, source_region, candidates_json)
-            VALUES
-                (%s, %s, %s, %s,
-                 %s, %s, %s, %s,
-                 %s, %s, %s, %s,
-                 %s, %s::geography, %s)
-            RETURNING id
-        """, (
-            latitude, longitude, spill_ts, image_filename,
-            duration_hours, n_particles, 15, windage,
-            _json.dumps(list(result.windage_coefficients)),
-            result.data_mode, result.provider_name, "COMPLETED",
-            _json.dumps(traj_summary),
-            f"SRID=4326;{source_wkt}" if source_wkt else None,
-            _json.dumps(candidates_json_list),
-        ))
+        img_analysis_db = None
+        if image_analysis_response:
+            img_analysis_db = {k: v for k, v in image_analysis_response.items()
+                               if k != "maskPngBase64"}
+
+        try:
+            cur.execute("""
+                INSERT INTO historical_investigations
+                    (spill_lat, spill_lon, spill_timestamp, image_filename,
+                     duration_hours, particle_count, timestep_minutes, windage,
+                     windage_ensemble, data_mode, provider_name, status,
+                     trajectory_summary, source_region, candidates_json,
+                     segmentation_detected, geometry_source, spill_area_km2,
+                     spill_pixel_count, spill_fraction, segmentation_confidence,
+                     image_analysis_json, uncertainty_radius_m)
+                VALUES
+                    (%s, %s, %s, %s,
+                     %s, %s, %s, %s,
+                     %s, %s, %s, %s,
+                     %s, %s::geography, %s,
+                     %s, %s, %s,
+                     %s, %s, %s,
+                     %s, %s)
+                RETURNING id
+            """, (
+                latitude, longitude, spill_ts, image_filename,
+                duration_hours, n_particles, 15, windage,
+                _json.dumps(list(result.windage_coefficients)),
+                result.data_mode, result.provider_name, "COMPLETED",
+                _json.dumps(traj_summary),
+                f"SRID=4326;{source_wkt}" if source_wkt else None,
+                _json.dumps(candidates_json_list),
+                segmentation_result.detected if segmentation_result else None,
+                geometry_source,
+                segmentation_result.spill_area_km2 if segmentation_result else None,
+                segmentation_result.spill_pixel_count if segmentation_result else None,
+                segmentation_result.spill_fraction if segmentation_result else None,
+                segmentation_result.segmentation_confidence if segmentation_result else None,
+                _json.dumps(img_analysis_db) if img_analysis_db else None,
+                uncertainty_radius_m,
+            ))
+        except Exception as db_exc:
+            conn.rollback()
+            logger.warning("[Investigation] Falling back to 005-schema insert: %s", db_exc)
+            cur.execute("""
+                INSERT INTO historical_investigations
+                    (spill_lat, spill_lon, spill_timestamp, image_filename,
+                     duration_hours, particle_count, timestep_minutes, windage,
+                     windage_ensemble, data_mode, provider_name, status,
+                     trajectory_summary, source_region, candidates_json)
+                VALUES
+                    (%s, %s, %s, %s,
+                     %s, %s, %s, %s,
+                     %s, %s, %s, %s,
+                     %s, %s::geography, %s)
+                RETURNING id
+            """, (
+                latitude, longitude, spill_ts, image_filename,
+                duration_hours, n_particles, 15, windage,
+                _json.dumps(list(result.windage_coefficients)),
+                result.data_mode, result.provider_name, "COMPLETED",
+                _json.dumps(traj_summary),
+                f"SRID=4326;{source_wkt}" if source_wkt else None,
+                _json.dumps(candidates_json_list),
+            ))
+
         row = cur.fetchone()
         saved_id = str(row[0]) if row else result.investigation_id
         conn.commit()
@@ -2074,44 +2233,47 @@ async def run_historical_investigation(
         conn.close()
         investigation_id = saved_id
     except Exception as exc:
-        # DB save failure should not block the response
         print(f"[WARNING] Could not save historical investigation to DB: {exc}")
         investigation_id = result.investigation_id
 
-    # ── 6. Build response ─────────────────────────────────────────────────
+    # -- 8. Build response -----------------------------------------------
     response = {
         "investigationId": investigation_id,
-        "dataMode": result.data_mode,
+        "dataMode":        result.data_mode,
         "disclaimer": (
-            "Results are CANDIDATE vessels only — NOT confirmed polluters. "
+            "Results are CANDIDATE vessels only -- NOT confirmed polluters. "
             "The attribution score is an investigation priority metric, "
             "not a legally valid probability."
         ),
         "spillObservation": {
-            "latitude": latitude,
-            "longitude": longitude,
-            "timestamp": spill_ts.isoformat(),
-            "imageFilename": image_filename,
+            "latitude":             latitude,
+            "longitude":            longitude,
+            "timestamp":            spill_ts.isoformat(),
+            "imageFilename":        image_filename,
+            "geometrySource":       geometry_source,
+            "segmentationDetected": segmentation_result.detected if segmentation_result else False,
+            "uncertaintyRadiusM":   uncertainty_radius_m,
         },
+        "imageAnalysis": image_analysis_response,
         "model": {
-            "type": "lagrangian_particle_backtracking",
-            "description": "Lagrangian particle-based oil-spill transport and backtracking model",
-            "particles": n_particles,
-            "timestepMinutes": 15,
-            "durationHours": duration_hours,
+            "type":                "lagrangian_particle_backtracking",
+            "description":        "Lagrangian particle-based oil-spill transport and backtracking model",
+            "particles":          n_particles,
+            "timestepMinutes":    15,
+            "durationHours":      duration_hours,
             "windageCoefficients": result.windage_coefficients,
         },
         "trajectory": {
             "timesteps": [
                 {
-                    "step": s.step,
-                    "hoursAgo": s.hours_ago,
-                    "timestamp": s.timestamp,
-                    "lat": s.lat,
-                    "lon": s.lon,
+                    "step":          s.step,
+                    "hoursAgo":      s.hours_ago,
+                    "timestamp":     s.timestamp,
+                    "lat":           s.lat,
+                    "lon":           s.lon,
                     "particleCount": s.particle_count,
-                    "uOilMs": s.u_oil,
-                    "vOilMs": s.v_oil,
+                    "uOilMs":        s.u_oil,
+                    "vOilMs":        s.v_oil,
                 }
                 for s in result.trajectory_steps
             ],
@@ -2120,20 +2282,21 @@ async def run_historical_investigation(
             ],
         },
         "sourceRegion": {
-            "centroidLat": result.source_region.centroid_lat,
-            "centroidLon": result.source_region.centroid_lon,
-            "polygon": [
+            "centroidLat":        result.source_region.centroid_lat,
+            "centroidLon":        result.source_region.centroid_lon,
+            "polygon":            [
                 {"lat": p[0], "lon": p[1]} for p in result.source_region.polygon
             ],
-            "uncertaintyNote": result.source_region.uncertainty_note,
+            "uncertaintyNote":    result.source_region.uncertainty_note,
             "windageConsistency": result.source_region.windage_consistency,
         },
         "environment": {
-            "dataMode": result.data_mode,
-            "provider": result.provider_name,
-            "note": result.provider_note,
+            "dataMode":  result.data_mode,
+            "provider":  result.provider_name,
+            "note":      result.provider_note,
+            "envError":  env_error,
         },
-        "candidates": candidates_json_list,
+        "candidates":       candidates_json_list,
         "aisMatchingError": ais_error,
     }
     return response
