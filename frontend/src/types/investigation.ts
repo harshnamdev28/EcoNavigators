@@ -63,6 +63,9 @@ export interface ImageAnalysisResult {
   maskPngBase64?: string | null;                        // base64 RGBA PNG for overlay
   reason?: string;
   error?: string | null;
+  // Geographic polygon for map overlay — present when geometrySource === 'IMAGE_DERIVED'
+  // Coordinates follow Leaflet convention: each point is {latitude, longitude}
+  spillPolygonGeo?: Array<{ latitude: number; longitude: number }> | null;
 }
 
 export interface InvestigationCandidate {

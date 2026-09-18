@@ -1,6 +1,6 @@
-﻿'use client';
+'use client';
 import React, { useRef, useState } from 'react';
-import { Search, Upload, Clock, MapPin, Wind, Layers, X } from 'lucide-react';
+import { Search, Upload, Clock, MapPin, Wind, Layers, X, Shield, FlaskConical } from 'lucide-react';
 
 interface InputPanelProps {
   onSubmit: (data: {
@@ -10,19 +10,23 @@ interface InputPanelProps {
     durationHours: number;
     windage: number;
     nParticles: number;
+    uncertaintyRadiusM: number;
+    dataMode: 'DEMO' | 'LIVE';
     file?: File;
   }) => void;
   isLoading: boolean;
 }
 
 export default function InputPanel({ onSubmit, isLoading }: InputPanelProps) {
-  const [lat, setLat] = useState('25.7715');
-  const [lon, setLon] = useState('-80.1518');
-  const [date, setDate] = useState('2026-09-05');
-  const [time, setTime] = useState('10:39');
+  const [lat, setLat] = useState('');
+  const [lon, setLon] = useState('');
+  const [date, setDate] = useState('');
+  const [time, setTime] = useState('');
   const [durationHours, setDurationHours] = useState(24);
   const [windage, setWindage] = useState(0.03);
   const [nParticles, setNParticles] = useState(500);
+  const [uncertaintyRadiusM, setUncertaintyRadiusM] = useState(5000);
+  const [dataMode, setDataMode] = useState<'DEMO' | 'LIVE'>('DEMO');
   const [file, setFile] = useState<File | null>(null);
   const [dragOver, setDragOver] = useState(false);
   const [errors, setErrors] = useState<Record<string, string>>({});
@@ -32,8 +36,10 @@ export default function InputPanel({ onSubmit, isLoading }: InputPanelProps) {
     const errs: Record<string, string> = {};
     const latN = parseFloat(lat);
     const lonN = parseFloat(lon);
-    if (isNaN(latN) || latN < -90 || latN > 90) errs.lat = 'Latitude must be -90 to 90';
-    if (isNaN(lonN) || lonN < -180 || lonN > 180) errs.lon = 'Longitude must be -180 to 180';
+    if (!lat.trim() || isNaN(latN) || latN < -90 || latN > 90)
+      errs.lat = 'Latitude must be -90 to 90';
+    if (!lon.trim() || isNaN(lonN) || lonN < -180 || lonN > 180)
+      errs.lon = 'Longitude must be -180 to 180';
     if (!date) errs.date = 'Date is required';
     if (!time) errs.time = 'Time is required';
     setErrors(errs);
@@ -51,6 +57,8 @@ export default function InputPanel({ onSubmit, isLoading }: InputPanelProps) {
       durationHours,
       windage,
       nParticles,
+      uncertaintyRadiusM,
+      dataMode,
       file: file || undefined,
     });
   }
@@ -180,7 +188,7 @@ export default function InputPanel({ onSubmit, isLoading }: InputPanelProps) {
               style={{ ...inputStyle, borderColor: errors.lat ? '#f43f5e' : undefined }}
               value={lat}
               onChange={(e) => setLat(e.target.value)}
-              placeholder="25.7715"
+              placeholder="e.g. 25.7715"
             />
             {errors.lat && <div style={{ color: '#f43f5e', fontSize: '0.6rem', marginTop: '2px' }}>{errors.lat}</div>}
           </div>
@@ -190,7 +198,7 @@ export default function InputPanel({ onSubmit, isLoading }: InputPanelProps) {
               style={{ ...inputStyle, borderColor: errors.lon ? '#f43f5e' : undefined }}
               value={lon}
               onChange={(e) => setLon(e.target.value)}
-              placeholder="-80.1518"
+              placeholder="e.g. -80.1518"
             />
             {errors.lon && <div style={{ color: '#f43f5e', fontSize: '0.6rem', marginTop: '2px' }}>{errors.lon}</div>}
           </div>
@@ -271,6 +279,69 @@ export default function InputPanel({ onSubmit, isLoading }: InputPanelProps) {
           />
           <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.6rem', color: 'var(--text-muted)', fontFamily: 'var(--font-mono)' }}>
             <span>100</span><span>1000</span>
+          </div>
+        </div>
+
+        {/* Uncertainty radius */}
+        <div style={fieldStyle}>
+          <div style={{ ...labelStyle, justifyContent: 'space-between' }}>
+            <span>Uncertainty radius</span>
+            <span style={{ color: '#00d7b2' }}>
+              {uncertaintyRadiusM >= 1000
+                ? `${(uncertaintyRadiusM / 1000).toFixed(0)} km`
+                : `${uncertaintyRadiusM} m`}
+            </span>
+          </div>
+          <input
+            type="range" min={500} max={50000} step={500}
+            value={uncertaintyRadiusM}
+            onChange={(e) => setUncertaintyRadiusM(Number(e.target.value))}
+            style={{ width: '100%', accentColor: '#00d7b2' }}
+          />
+          <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.6rem', color: 'var(--text-muted)', fontFamily: 'var(--font-mono)' }}>
+            <span>500 m</span><span>50 km</span>
+          </div>
+        </div>
+
+        {/* Data mode */}
+        <div style={fieldStyle}>
+          <div style={labelStyle}><Shield size={10} /> Environmental Data Mode</div>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '6px' }}>
+            {(['DEMO', 'LIVE'] as const).map((mode) => (
+              <button
+                key={mode}
+                type="button"
+                onClick={() => setDataMode(mode)}
+                style={{
+                  padding: '6px',
+                  borderRadius: '4px',
+                  border: `1px solid ${dataMode === mode
+                    ? (mode === 'DEMO' ? 'rgba(251,191,36,0.6)' : 'rgba(0,215,178,0.6)')
+                    : 'rgba(255,255,255,0.1)'}`,
+                  background: dataMode === mode
+                    ? (mode === 'DEMO' ? 'rgba(251,191,36,0.1)' : 'rgba(0,215,178,0.1)')
+                    : 'rgba(0,0,0,0.2)',
+                  color: dataMode === mode
+                    ? (mode === 'DEMO' ? '#fbbf24' : '#00d7b2')
+                    : 'var(--text-muted)',
+                  fontSize: '0.68rem',
+                  fontFamily: 'var(--font-mono)',
+                  cursor: 'pointer',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  gap: '4px',
+                }}
+              >
+                {mode === 'DEMO' ? <FlaskConical size={10} /> : <Shield size={10} />}
+                {mode}
+              </button>
+            ))}
+          </div>
+          <div style={{ fontSize: '0.58rem', color: 'var(--text-muted)', fontFamily: 'var(--font-mono)', marginTop: '4px' }}>
+            {dataMode === 'DEMO'
+              ? 'DEMO: synthetic environmental data — clearly labeled'
+              : 'LIVE: real NOAA ERDDAP HYCOM data — requires internet'}
           </div>
         </div>
 

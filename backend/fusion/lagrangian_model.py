@@ -224,8 +224,14 @@ def _meters_per_deg_lon(lat_deg: float) -> float:
 
 
 def _compute_diffusion_sigma(timestep_sec: float) -> float:
-    """sigma = sqrt(2 * K * dt) for Fickian diffusion."""
-    return math.sqrt(2.0 * _HORIZONTAL_DIFFUSIVITY_M2S * timestep_sec)
+    """
+    Velocity diffusion standard deviation (m/s) for turbulent/Fickian diffusion.
+    sigma_v = sqrt(2 * K / dt) such that position displacement over dt
+    has standard deviation sigma_x = sigma_v * dt = sqrt(2 * K * dt).
+    With K=10 m^2/s and dt=900s: sigma_v = sqrt(20/900) ≈ 0.149 m/s,
+    yielding displacement std of ~134 meters per 15-min step.
+    """
+    return math.sqrt(2.0 * _HORIZONTAL_DIFFUSIVITY_M2S / max(1.0, timestep_sec))
 
 
 def _convex_hull(points: List[Tuple[float, float]]) -> List[Tuple[float, float]]:

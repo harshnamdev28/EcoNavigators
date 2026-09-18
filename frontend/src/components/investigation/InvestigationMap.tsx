@@ -1,5 +1,5 @@
-﻿'use client';
-import React, { useEffect, useRef } from 'react';
+'use client';
+import React, { useEffect } from 'react';
 import {
   MapContainer, TileLayer, CircleMarker, Polygon, Polyline,
   Marker, Tooltip, LayersControl, useMap,
@@ -11,8 +11,16 @@ import { InvestigationResult, InvestigationCandidate } from '@/types/investigati
 const { BaseLayer } = LayersControl;
 
 // ---------------------------------------------------------------------------
-// Coordinate safety: ALL Leaflet positions use [lat, lon] tuples
-// PostGIS returns ST_X=lon, ST_Y=lat — conversion is done in API layer
+// Coordinate safety: ALL Leaflet positions use [lat, lon] tuples.
+//
+// Convention (enforced throughout):
+//   PostGIS  : ST_X(location) = longitude,  ST_Y(location) = latitude
+//   API JSON : { latitude, longitude }   or  { lat, lon }
+//   GeoJSON  : [longitude, latitude]
+//   Leaflet  : [latitude, longitude]
+//
+// This component NEVER performs coordinate swapping.  All [lat, lon] tuples
+// arrive from the API already in Leaflet-ready order.
 // ---------------------------------------------------------------------------
 
 interface InvestigationMapProps {
@@ -22,33 +30,71 @@ interface InvestigationMapProps {
   activeCandidate: InvestigationCandidate | null;
 }
 
-// Fit map to result bounds
+// ---------------------------------------------------------------------------
+// FitBounds — called whenever result changes; uses actual data geometry
+// ---------------------------------------------------------------------------
 function FitBounds({ result }: { result: InvestigationResult | null }) {
   const map = useMap();
   useEffect(() => {
     if (!result) return;
+
     const pts: [number, number][] = [];
 
-    // Spill location
-    pts.push([result.spillObservation.latitude, result.spillObservation.longitude]);
+    // 1. Observed spill — authoritative position
+    const obs = result.spillObservation;
+    if (
+      typeof obs.latitude === 'number' &&
+      typeof obs.longitude === 'number' &&
+      !isNaN(obs.latitude) &&
+      !isNaN(obs.longitude)
+    ) {
+      pts.push([obs.latitude, obs.longitude]);
+    }
 
-    // Trajectory centroids (sample every 4th to keep bounds tight)
+    // 2. Trajectory centroids (sample every 4th to keep bounds tight)
     result.trajectory.timesteps
       .filter((_, i) => i % 4 === 0)
-      .forEach((s) => pts.push([s.lat, s.lon]));
+      .forEach((s) => {
+        if (typeof s.lat === 'number' && typeof s.lon === 'number' &&
+            !isNaN(s.lat) && !isNaN(s.lon)) {
+          pts.push([s.lat, s.lon]);
+        }
+      });
 
-    // Source region centroid
-    pts.push([result.sourceRegion.centroidLat, result.sourceRegion.centroidLon]);
+    // 3. Source region centroid
+    if (
+      typeof result.sourceRegion.centroidLat === 'number' &&
+      typeof result.sourceRegion.centroidLon === 'number' &&
+      !isNaN(result.sourceRegion.centroidLat) &&
+      !isNaN(result.sourceRegion.centroidLon)
+    ) {
+      pts.push([result.sourceRegion.centroidLat, result.sourceRegion.centroidLon]);
+    }
 
-    if (pts.length > 0) {
+    // 4. Candidate vessel positions
+    result.candidates.forEach((c) => {
+      if (c.lat !== null && c.lon !== null &&
+          typeof c.lat === 'number' && typeof c.lon === 'number' &&
+          !isNaN(c.lat) && !isNaN(c.lon)) {
+        pts.push([c.lat, c.lon]);
+      }
+    });
+
+    if (pts.length >= 2) {
       const bounds = L.latLngBounds(pts);
-      map.fitBounds(bounds, { padding: [40, 40] });
+      if (bounds.isValid()) {
+        map.fitBounds(bounds, { padding: [40, 40] });
+      }
+    } else if (pts.length === 1) {
+      map.setView(pts[0], 8);
     }
   }, [result, map]);
   return null;
 }
 
+// ---------------------------------------------------------------------------
 // Candidate vessel marker icon
+// ---------------------------------------------------------------------------
 function candidateIcon(isActive: boolean, rank: number): L.DivIcon {
   const color = isActive ? '#f43f5e' : rank === 1 ? '#fbbf24' : '#00d7b2';
   return L.divIcon({
@@ -65,36 +111,73 @@ function candidateIcon(isActive: boolean, rank: number): L.DivIcon {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Main map component
+// ---------------------------------------------------------------------------
 export default function InvestigationMap({
   result,
   spillLat,
   spillLon,
   activeCandidate,
 }: InvestigationMapProps) {
-  // Default center — Florida / Gulf of Mexico
-  const defaultCenter: [number, number] = [spillLat ?? 25.77, spillLon ?? -80.15];
-  const defaultZoom = spillLat ? 7 : 5;
+  // Map center: use actual spill coordinates if available, otherwise world center.
+  // NEVER hardcode a geographic location as fallback.
+  const hasSpillCoords =
+    spillLat !== null &&
+    spillLon !== null &&
+    typeof spillLat === 'number' &&
+    typeof spillLon === 'number' &&
+    !isNaN(spillLat) &&
+    !isNaN(spillLon);
 
-  // Build Leaflet-format arrays: ALL use [lat, lon]
-  const spillPos: [number, number] | null =
-    result ? [result.spillObservation.latitude, result.spillObservation.longitude] : null;
+  const initialCenter: [number, number] = hasSpillCoords
+    ? [spillLat as number, spillLon as number]
+    : [20.0, 0.0]; // world center — no geographic bias
+  const initialZoom = hasSpillCoords ? 7 : 2;
 
-  // Trajectory envelope polygon — already [lat, lon] from API
+  // Observed spill marker position — lat/lon from API, directly to Leaflet
+  const spillPos: [number, number] | null = result
+    ? [result.spillObservation.latitude, result.spillObservation.longitude]
+    : hasSpillCoords
+    ? [spillLat as number, spillLon as number]
+    : null;
+
+  // Trajectory corridor envelope — API returns {lat, lon} objects
   const envelopePositions: [number, number][] =
-    result?.trajectory.envelopePolygon.map((p) => [p.lat, p.lon] as [number, number]) ?? [];
+    result?.trajectory.envelopePolygon
+      .filter((p) => typeof p.lat === 'number' && typeof p.lon === 'number')
+      .map((p) => [p.lat, p.lon] as [number, number]) ?? [];
 
-  // Source region polygon — already [lat, lon] from API
+  // Source region polygon — API returns {lat, lon} objects
   const sourcePositions: [number, number][] =
-    result?.sourceRegion.polygon.map((p) => [p.lat, p.lon] as [number, number]) ?? [];
+    result?.sourceRegion.polygon
+      .filter((p) => typeof p.lat === 'number' && typeof p.lon === 'number')
+      .map((p) => [p.lat, p.lon] as [number, number]) ?? [];
 
-  // Trajectory centroid path
+  // Trajectory centroid path — from trajectory timesteps
   const trajectoryPath: [number, number][] =
-    result?.trajectory.timesteps.map((s) => [s.lat, s.lon] as [number, number]) ?? [];
+    result?.trajectory.timesteps
+      .filter((s) => typeof s.lat === 'number' && typeof s.lon === 'number')
+      .map((s) => [s.lat, s.lon] as [number, number]) ?? [];
+
+  // IMAGE_DERIVED spill polygon — geographic coordinates returned by API
+  // These come from segmentation_polygon_to_geographic() → scaled around (spill_lat, spill_lon)
+  // API field: result.imageAnalysis.spillPolygonGeo = [{latitude, longitude}, ...]
+  const imageSpillPolygonPositions: [number, number][] = (() => {
+    const geo = (result?.imageAnalysis as any)?.spillPolygonGeo;
+    if (!Array.isArray(geo) || geo.length < 3) return [];
+    return geo
+      .filter((p: any) =>
+        typeof p.latitude === 'number' && typeof p.longitude === 'number' &&
+        !isNaN(p.latitude) && !isNaN(p.longitude)
+      )
+      .map((p: any) => [p.latitude, p.longitude] as [number, number]);
+  })();
 
   return (
     <MapContainer
-      center={defaultCenter}
-      zoom={defaultZoom}
+      center={initialCenter}
+      zoom={initialZoom}
       style={{ width: '100%', height: '100%', background: '#0b1723' }}
       zoomControl={true}
     >
@@ -122,6 +205,7 @@ export default function InvestigationMap({
         </BaseLayer>
       </LayersControl>
 
+      {/* Fit bounds to actual data once result arrives */}
       <FitBounds result={result} />
 
       {/* 1. Trajectory corridor envelope — orange fill */}
@@ -173,8 +257,8 @@ export default function InvestigationMap({
           <Tooltip sticky>
             <div style={{ fontFamily: 'monospace', fontSize: '11px' }}>
               <strong style={{ color: '#c026d3' }}>CANDIDATE SOURCE REGION</strong><br />
-              Centroid: {result?.sourceRegion.centroidLat.toFixed(4)}°N,{' '}
-              {result?.sourceRegion.centroidLon.toFixed(4)}°E<br />
+              Centroid: {result?.sourceRegion.centroidLat.toFixed(4)}°,{' '}
+              {result?.sourceRegion.centroidLon.toFixed(4)}°<br />
               <span style={{ color: '#999', fontSize: '10px' }}>
                 NOT a confirmed spill origin.
               </span>
@@ -183,7 +267,32 @@ export default function InvestigationMap({
         </Polygon>
       )}
 
-      {/* 4. Observed spill location — red circle */}
+      {/* 4. IMAGE_DERIVED spill polygon — cyan fill (only when geographic polygon available) */}
+      {imageSpillPolygonPositions.length >= 3 &&
+        result?.spillObservation.geometrySource === 'IMAGE_DERIVED' && (
+        <Polygon
+          positions={imageSpillPolygonPositions}
+          pathOptions={{
+            color: '#06b6d4',
+            fillColor: '#06b6d4',
+            fillOpacity: 0.20,
+            weight: 2,
+            dashArray: '3 4',
+          }}
+        >
+          <Tooltip sticky>
+            <div style={{ fontFamily: 'monospace', fontSize: '11px' }}>
+              <strong style={{ color: '#06b6d4' }}>MIT-B2 SEGMENTED SPILL</strong><br />
+              Image-derived geographic polygon<br />
+              <span style={{ color: '#999', fontSize: '10px' }}>
+                Approximate — no satellite georeferencing.
+              </span>
+            </div>
+          </Tooltip>
+        </Polygon>
+      )}
+
+      {/* 5. Observed spill location — red circle */}
       {spillPos && (
         <CircleMarker
           center={spillPos}
@@ -198,17 +307,21 @@ export default function InvestigationMap({
           <Tooltip permanent direction="top" offset={[0, -16]}>
             <div style={{ fontFamily: 'monospace', fontSize: '10px', fontWeight: 700, color: '#f43f5e' }}>
               OBSERVED SPILL<br />
-              {spillPos[0].toFixed(4)}°N, {spillPos[1].toFixed(4)}°E
+              {spillPos[0].toFixed(4)}°, {spillPos[1].toFixed(4)}°
             </div>
           </Tooltip>
         </CircleMarker>
       )}
 
-      {/* 5. Candidate vessel positions */}
+      {/* 6. Candidate vessel positions */}
       {result?.candidates
-        .filter((c) => c.lat !== null && c.lon !== null)
+        .filter((c) => c.lat !== null && c.lon !== null &&
+          typeof c.lat === 'number' && typeof c.lon === 'number' &&
+          !isNaN(c.lat) && !isNaN(c.lon))
         .map((c) => {
-          // c.lat and c.lon come from API (already lat/lon)
+          // c.lat and c.lon come from the API which extracts:
+          //   ST_Y(location) = latitude, ST_X(location) = longitude
+          // Leaflet receives [latitude, longitude] — no swapping needed.
           const pos: [number, number] = [c.lat as number, c.lon as number];
           const isActive = activeCandidate?.mmsi === c.mmsi;
           return (

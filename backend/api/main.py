@@ -1994,6 +1994,9 @@ async def run_historical_investigation(
                 "maskPngBase64":          segmentation_result.mask_png_base64,
                 "reason":                 segmentation_result.reason,
                 "error":                  segmentation_result.error,
+                # spillPolygonGeo is populated in step 3 after geographic conversion;
+                # set placeholder here so the key always exists in the response.
+                "spillPolygonGeo":        None,
             }
 
             if segmentation_result.error:
@@ -2027,6 +2030,15 @@ async def run_historical_investigation(
                 len(geo_polygon),
                 segmentation_result.spill_area_km2,
             )
+            # Populate spillPolygonGeo in imageAnalysis so frontend can render
+            # the geographic polygon on the map.
+            # geo_polygon is [(lat, lon), ...] — we serialize as {latitude, longitude}
+            # so the Leaflet layer can use [p.latitude, p.longitude] without confusion.
+            if image_analysis_response is not None:
+                image_analysis_response["spillPolygonGeo"] = [
+                    {"latitude": round(float(lat_p), 6), "longitude": round(float(lon_p), 6)}
+                    for lat_p, lon_p in geo_polygon
+                ]
         except Exception as exc:
             logger.warning("[Investigation] Polygon geo-conversion failed: %s", exc)
             spill_polygon = None
