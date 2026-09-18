@@ -12,6 +12,7 @@ import {
   AlertTriangle,
   Activity,
   HelpCircle,
+  Search,
 } from 'lucide-react';
 
 const NAV_ITEMS = [
@@ -20,6 +21,7 @@ const NAV_ITEMS = [
   { name: 'Oil Spill Detection', path: '/spills', icon: Droplets },
   { name: 'SAR Oil Spill Detection', path: '/sar-detection', icon: Scan },
   { name: 'Backtracking Analysis', path: '/backtracking', icon: History },
+  { name: 'Historical Investigation', path: '/historical-investigation', icon: Search },
   { name: 'Alerts', path: '/alerts', icon: Bell },
 ];
 

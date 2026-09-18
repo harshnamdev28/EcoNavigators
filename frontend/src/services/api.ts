@@ -522,3 +522,55 @@ export async function getIncidents(): Promise<Incident[]> {
   );
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Historical Oil Spill Investigation (Lagrangian particle backtracking)
+// ─────────────────────────────────────────────────────────────────────────────
+import type { InvestigationResult } from '@/types/investigation';
+
+/**
+ * POST /api/v1/historical-investigation
+ *
+ * Accepts multipart form data. Runs Lagrangian backtracking and AIS matching.
+ * Always returns structured result even if AIS matching finds no candidates.
+ * NEVER falls back to fabricated vessels.
+ */
+export async function runHistoricalInvestigation(params: {
+  latitude: number;
+  longitude: number;
+  timestamp: string;
+  durationHours: number;
+  windage: number;
+  nParticles: number;
+  file?: File;
+}): Promise<InvestigationResult> {
+  const formData = new FormData();
+  formData.append('latitude', String(params.latitude));
+  formData.append('longitude', String(params.longitude));
+  formData.append('timestamp', params.timestamp);
+  formData.append('duration_hours', String(params.durationHours));
+  formData.append('windage', String(params.windage));
+  formData.append('n_particles', String(params.nParticles));
+  if (params.file) {
+    formData.append('file', params.file);
+  }
+
+  const res = await fetch(`${API_BASE_URL}/historical-investigation`, {
+    method: 'POST',
+    body: formData,
+    // Do NOT set Content-Type — browser must set multipart boundary automatically
+  });
+
+  if (!res.ok) {
+    let detail = `HTTP ${res.status}`;
+    try {
+      const err = await res.json();
+      detail = err?.detail || detail;
+    } catch {
+      // ignore JSON parse error
+    }
+    throw new ApiError(`Historical investigation failed: ${detail}`, res.status);
+  }
+
+  return res.json() as Promise<InvestigationResult>;
+}
+

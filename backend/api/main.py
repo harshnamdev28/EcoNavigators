@@ -15,7 +15,7 @@ Changes vs prior version
 import logging
 import time
 import uuid
-from fastapi import FastAPI, HTTPException, APIRouter, File, UploadFile
+from fastapi import FastAPI, HTTPException, APIRouter, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any, Tuple
@@ -1895,6 +1895,248 @@ async def analyze_sar_image_endpoint(
             status_code=500,
             detail="SAR image analysis failed due to an internal processing error.",
         )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Historical Oil Spill Investigation  (Lagrangian particle backtracking)
+# ─────────────────────────────────────────────────────────────────────────────
+from fusion.lagrangian_model import (
+    LagrangianModel,
+    MockEnvironmentalProvider,
+    SpillObservation,
+    parse_spill_timestamp,
+)
+from fusion.historical_ais_matcher import find_candidate_vessels
+import json as _json
+
+
+@router.post("/historical-investigation")
+async def run_historical_investigation(
+    latitude: float = Form(...),
+    longitude: float = Form(...),
+    timestamp: str = Form(...),
+    duration_hours: int = Form(default=24, ge=1, le=48),
+    windage: float = Form(default=0.03, ge=0.005, le=0.10),
+    n_particles: int = Form(default=500, ge=10, le=1000),
+    file: Optional[UploadFile] = File(default=None),
+):
+    """
+    POST /api/v1/historical-investigation
+
+    Runs Lagrangian particle backtracking from an observed oil-spill location
+    and matches historical AIS vessel data to produce attribution candidates.
+
+    Data mode:
+      "dataMode": "DEMO"  — when MockEnvironmentalProvider is active (default)
+      "dataMode": "LIVE"  — when a real env-data provider is configured
+
+    Results are CANDIDATE vessels only — NOT confirmed polluters.
+    """
+    # ── 1. Validate inputs ────────────────────────────────────────────────
+    if not (-90.0 <= latitude <= 90.0):
+        raise HTTPException(status_code=422, detail=f"Invalid latitude: {latitude}")
+    if not (-180.0 <= longitude <= 180.0):
+        raise HTTPException(status_code=422, detail=f"Invalid longitude: {longitude}")
+
+    try:
+        spill_ts = parse_spill_timestamp(timestamp)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    image_filename: Optional[str] = None
+    if file is not None:
+        image_filename = file.filename
+
+    # ── 2. Build SpillObservation ─────────────────────────────────────────
+    try:
+        obs = SpillObservation(
+            latitude=latitude,
+            longitude=longitude,
+            timestamp=spill_ts,
+            image_filename=image_filename,
+            uncertainty_radius_m=5_000.0,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    # ── 3. Run Lagrangian model ───────────────────────────────────────────
+    # Use MockEnvironmentalProvider (DEMO) by default.
+    # To switch to a live provider, read credentials from environment vars and
+    # instantiate the appropriate EnvironmentalDataProvider subclass here.
+    provider = MockEnvironmentalProvider()
+    lag_model = LagrangianModel(provider)
+
+    try:
+        result = lag_model.run_backward(
+            obs=obs,
+            n_particles=n_particles,
+            duration_hours=float(duration_hours),
+            timestep_min=15,
+            windage_coefficients=(0.01, windage, min(0.04, windage + 0.01)),
+            seed=None,    # non-deterministic for real investigations
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Lagrangian simulation failed: {str(exc)}",
+        )
+
+    # ── 4. Query historical AIS ───────────────────────────────────────────
+    trajectory_centroids = [
+        (step.lat, step.lon) for step in result.trajectory_steps
+    ]
+    ais_candidates = []
+    ais_error: Optional[str] = None
+    try:
+        ais_candidates = find_candidate_vessels(
+            trajectory_centroids=trajectory_centroids,
+            spill_lat=latitude,
+            spill_lon=longitude,
+            spill_timestamp=spill_ts,
+            duration_hours=float(duration_hours),
+        )
+    except Exception as exc:
+        ais_error = str(exc)
+
+    # ── 5. Save investigation to DB ───────────────────────────────────────
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+
+        # Compact trajectory summary (centroid per step only — not per-particle)
+        traj_summary = [
+            {
+                "step": s.step,
+                "hours_ago": s.hours_ago,
+                "ts": s.timestamp,
+                "lat": s.lat,
+                "lon": s.lon,
+            }
+            for s in result.trajectory_steps
+        ]
+
+        # Build PostGIS polygon from source region (lon, lat for ST_MakePoint)
+        source_polygon_pts = result.source_region.polygon
+        source_wkt: Optional[str] = None
+        if len(source_polygon_pts) >= 3:
+            ring = ", ".join(
+                f"{lon} {lat}" for lat, lon in source_polygon_pts
+            )
+            # Close the ring
+            first_lat, first_lon = source_polygon_pts[0]
+            ring += f", {first_lon} {first_lat}"
+            source_wkt = f"POLYGON(({ring}))"
+
+        candidates_json_list = [
+            {
+                "rank": c.rank,
+                "mmsi": c.mmsi,
+                "vesselName": c.vessel_name,
+                "imo": c.imo,
+                "minDistanceKm": c.min_distance_km,
+                "trajectoryOverlapScore": c.trajectory_overlap_score,
+                "timeMatchScore": c.time_match_score,
+                "aisAnomalyScore": c.ais_anomaly_score,
+                "attributionScore": c.attribution_score,
+                "matchingAisPings": c.matching_ais_pings,
+                "lat": c.lat,
+                "lon": c.lon,
+                "positionTimestamp": c.position_timestamp,
+            }
+            for c in ais_candidates
+        ]
+
+        cur.execute("""
+            INSERT INTO historical_investigations
+                (spill_lat, spill_lon, spill_timestamp, image_filename,
+                 duration_hours, particle_count, timestep_minutes, windage,
+                 windage_ensemble, data_mode, provider_name, status,
+                 trajectory_summary, source_region, candidates_json)
+            VALUES
+                (%s, %s, %s, %s,
+                 %s, %s, %s, %s,
+                 %s, %s, %s, %s,
+                 %s, %s::geography, %s)
+            RETURNING id
+        """, (
+            latitude, longitude, spill_ts, image_filename,
+            duration_hours, n_particles, 15, windage,
+            _json.dumps(list(result.windage_coefficients)),
+            result.data_mode, result.provider_name, "COMPLETED",
+            _json.dumps(traj_summary),
+            f"SRID=4326;{source_wkt}" if source_wkt else None,
+            _json.dumps(candidates_json_list),
+        ))
+        row = cur.fetchone()
+        saved_id = str(row[0]) if row else result.investigation_id
+        conn.commit()
+        cur.close()
+        conn.close()
+        investigation_id = saved_id
+    except Exception as exc:
+        # DB save failure should not block the response
+        print(f"[WARNING] Could not save historical investigation to DB: {exc}")
+        investigation_id = result.investigation_id
+
+    # ── 6. Build response ─────────────────────────────────────────────────
+    response = {
+        "investigationId": investigation_id,
+        "dataMode": result.data_mode,
+        "disclaimer": (
+            "Results are CANDIDATE vessels only — NOT confirmed polluters. "
+            "The attribution score is an investigation priority metric, "
+            "not a legally valid probability."
+        ),
+        "spillObservation": {
+            "latitude": latitude,
+            "longitude": longitude,
+            "timestamp": spill_ts.isoformat(),
+            "imageFilename": image_filename,
+        },
+        "model": {
+            "type": "lagrangian_particle_backtracking",
+            "description": "Lagrangian particle-based oil-spill transport and backtracking model",
+            "particles": n_particles,
+            "timestepMinutes": 15,
+            "durationHours": duration_hours,
+            "windageCoefficients": result.windage_coefficients,
+        },
+        "trajectory": {
+            "timesteps": [
+                {
+                    "step": s.step,
+                    "hoursAgo": s.hours_ago,
+                    "timestamp": s.timestamp,
+                    "lat": s.lat,
+                    "lon": s.lon,
+                    "particleCount": s.particle_count,
+                    "uOilMs": s.u_oil,
+                    "vOilMs": s.v_oil,
+                }
+                for s in result.trajectory_steps
+            ],
+            "envelopePolygon": [
+                {"lat": p[0], "lon": p[1]} for p in result.envelope_polygon
+            ],
+        },
+        "sourceRegion": {
+            "centroidLat": result.source_region.centroid_lat,
+            "centroidLon": result.source_region.centroid_lon,
+            "polygon": [
+                {"lat": p[0], "lon": p[1]} for p in result.source_region.polygon
+            ],
+            "uncertaintyNote": result.source_region.uncertainty_note,
+            "windageConsistency": result.source_region.windage_consistency,
+        },
+        "environment": {
+            "dataMode": result.data_mode,
+            "provider": result.provider_name,
+            "note": result.provider_note,
+        },
+        "candidates": candidates_json_list,
+        "aisMatchingError": ais_error,
+    }
+    return response
 
 
 @router.get("/health")
